@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+Feature engineering:
+- rolling mean/std
+- slope per sensor (linear fit)
+- FFT top-k magnitudes
+- lap-normalization
+Also computes the correlation of the single raw signal (tire temp mean)
+vs. the engineered degradation slope, and prints relative improvement.
+"""
+import argparse
+import numpy as np
+import os
+import sys
+from scipy.stats import pearsonr
+
+def build_features(data_dict):
+    data = data_dict['data']  # (n, seq_len, sensors)
+    labels = data_dict['labels']
+    n, seq_len, sensors = data.shape
+
+    # Tabular feature matrix
+    feats = []
+
+    # 1) raw means & stds per sensor
+    means = data.mean(axis=1)
+    stds = data.std(axis=1)
+    feats.append(means)
+    feats.append(stds)
+
+    # 2) slope per sensor (vectorized linear regression on time index)
+    # Formula: sum((x - mean_x) * (y - mean_y)) / sum((x - mean_x)^2)
+    idx = np.arange(seq_len)
+    idx_centered = idx - idx.mean()
+    denominator = np.sum(idx_centered**2)
+    
+    # Center the data along the time axis (axis 1)
+    # We save this variable to reuse in the FFT step
+    data_centered = data - means[:, None, :] 
+    
+    # Broadcasting multiply: (seq_len,) * (n, seq_len, sensors) -> sum over seq_len
+    numerator = np.sum(idx_centered.reshape(1, -1, 1) * data_centered, axis=1)
+    slopes = numerator / denominator
+    
+    feats.append(slopes)
+
+    # 3) FFT magnitude top2 per sensor
+    fft_feats = np.zeros((n, sensors*2))
+    
+    # Use the pre-centered data to avoid recalculation
+    for i in range(n):
+        for s in range(sensors):
+            # y_centered is already mean-subtracted
+            y_centered = data_centered[i, :, s]
+            yf = np.fft.rfft(y_centered)
+            mags = np.abs(yf)
+            
+            # skip DC [0] (which should be near 0 for centered data), take top-2
+            if mags.size <= 2:
+                top = mags[1:3]
+            else:
+                idxs = np.argsort(mags[1:])[-2:] + 1
+                top = mags[idxs]
+            
+            # Handle edge cases where signal is too short
+            if len(top) < 2:
+                padded = np.zeros(2)
+                padded[:len(top)] = top
+                top = padded
+                
+            fft_feats[i, s*2:(s*2+2)] = top
+    feats.append(fft_feats)
+
+    # 4) crafted degradation metric: weighted sum of slopes + delta of temps
+    # We treat sensor 0 as tire_temp (most predictive)
+    temp_slope = slopes[:, 0:1]
+    temp_mean = means[:, 0:1]
+    temp_delta = data[:, -1, 0:1] - data[:, 0, 0:1]
+    
+    # Heuristic weighting based on domain knowledge
+    degradation_metric = 0.8*temp_slope + 0.15*(temp_mean/100.0) + 0.05*(temp_delta/10.0)
+    feats.append(degradation_metric)
+
+    X = np.concatenate(feats, axis=1)
+    
+    # Return features, labels, and metadata for analysis
+    return X, labels, {'means': means, 'slopes': slopes, 'degradation_metric': degradation_metric}
+
+def measure_signal_improvement(data_dict, feat_dict):
+    """
+    Computes a simple 'signal' measure: Pearson correlation between
+    the raw tire_temp_mean and label vs correlation between degradation_metric and label.
+    """
+    raw = feat_dict['means'][:,0]
+    new = feat_dict['degradation_metric'].flatten()
+    labels = data_dict['labels']
+
+    corr_raw, _ = pearsonr(raw, labels)
+    corr_new, _ = pearsonr(new, labels)
+
+    # Compute actual improvement
+    improvement = (corr_new - corr_raw) / (abs(corr_raw) + 1e-12) * 100.0
+
+    return corr_raw, corr_new, improvement
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--in', dest='infile', default='data/raw/f1_telemetry.npy')
+    parser.add_argument('--out', dest='outfile', default='data/processed/features.npz')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    # Load raw data
+    if not os.path.exists(args.infile):
+        print(f"Error: Input file {args.infile} not found.")
+        sys.exit(1)
+
+    raw = np.load(args.infile, allow_pickle=True).item()
+    
+    # Build features
+    X, y, feat_dict = build_features(raw)
+    
+    # Measure improvement
+    corr_raw, corr_new, improvement = measure_signal_improvement(raw, feat_dict)
+
+    # Save processed data
+    os.makedirs(os.path.dirname(args.outfile), exist_ok=True)
+    np.savez_compressed(args.outfile, X=X, y=y, meta=feat_dict)
+    
+    print(f"Saved features to {args.outfile}")
+    print(f"Raw correlation (tire_temp_mean, label): {corr_raw:.6f}")
+    print(f"Engineered correlation (degradation_metric, label): {corr_new:.6f}")
+    print(f"Actual Signal Improvement: {improvement:.2f}%")

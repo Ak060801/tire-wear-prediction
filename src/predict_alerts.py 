@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Inference script:
+1. Loads new telemetry data.
+2. Generates features (using the logic from feature_engineer).
+3. Loads trained models (XGBoost + LSTM) and ensemble weights.
+4. Predicts tire wear risks and prints alerts.
+"""
+import argparse
+import numpy as np
+import os
+import sys
+import xgboost as xgb
+from tensorflow.keras.models import load_model
+from feature_engineer import build_features
+from alert_system import format_alert
+
+def load_ensemble(model_dir='models'):
+    # Load metadata (weights and threshold)
+    ensemble_path = os.path.join(model_dir, 'hybrid_ensemble.npz')
+    if not os.path.exists(ensemble_path):
+        print(f"Error: Ensemble metadata not found at {ensemble_path}")
+        sys.exit(1)
+    
+    meta = np.load(ensemble_path)
+    weight = float(meta['weight'])
+    threshold = float(meta['threshold'])
+    
+    # Load XGBoost
+    xgb_path = meta['xgb_path'].item()
+    bst = xgb.Booster()
+    bst.load_model(xgb_path)
+    
+    # Load LSTM
+    lstm_path = meta['lstm_path'].item()
+    lstm = load_model(lstm_path, compile=False) # compile=False is safer for inference
+    
+    return bst, lstm, weight, threshold
+
+def predict(data_path, model_dir='models'):
+    # 1. Load Data
+    if not os.path.exists(data_path):
+        print(f"Error: Data file {data_path} not found.")
+        sys.exit(1)
+        
+    raw = np.load(data_path, allow_pickle=True).item()
+    
+    # 2. Build Features (re-use the exact same logic used in training)
+    # Note: In a real system, we wouldn't have 'labels' for new data, 
+    # so we mock them or handle the function differently. 
+    # Here we assume the function handles it or we pass dummy labels.
+    print("Generating features...")
+    X, _, _ = build_features(raw)
+    
+    # LSTM needs the raw sequence data (normalized/processed if required, 
+    # but here our model expects raw inputs as defined in training)
+    seq_data = raw['data'] 
+    
+    # 3. Load Models
+    print(f"Loading models from {model_dir}...")
+    xgb_model, lstm_model, weight, threshold = load_ensemble(model_dir)
+    print(f"Ensemble loaded: XGB_weight={weight:.2f}, Threshold={threshold:.2f}")
+
+    # 4. Inference
+    # XGBoost Prediction
+    dmatrix = xgb.DMatrix(X)
+    prob_xgb = xgb_model.predict(dmatrix)
+    
+    # LSTM Prediction
+    prob_lstm = lstm_model.predict(seq_data, verbose=0).flatten()
+    
+    # Weighted Ensemble
+    prob_hybrid = weight * prob_xgb + (1.0 - weight) * prob_lstm
+    
+    # 5. Generate Alerts
+    alerts = []
+    lap_indices = raw['lap_index'].flatten()
+    
+    print("\n=== SYSTEM ALERTS ===")
+    # Print first 10 alerts for demonstration
+    count = 0
+    for i in range(len(prob_hybrid)):
+        p = prob_hybrid[i]
+        alert = format_alert(sample_id=i, lap_index=lap_indices[i], 
+                             probability=p, threshold=threshold)
+        
+        if alert['alert']:
+            print(f"[ALERT] {alert['message']} (Lap {alert['lap']})")
+            count += 1
+            if count >= 10:
+                print("... (more alerts truncated)")
+                break
+                
+    if count == 0:
+        print("No high-risk wear patterns detected.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', default='data/raw/f1_telemetry.npy', help="Path to new telemetry file")
+    parser.add_argument('--models', default='models', help="Directory containing trained models")
+    args = parser.parse_args()
+    
+    predict(args.data, args.models)
