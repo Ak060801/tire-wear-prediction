@@ -1,4 +1,3 @@
-# tire-wear-prediction
 # 🏎️ Tire Wear Prediction Using Hybrid XGBoost–LSTM
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
